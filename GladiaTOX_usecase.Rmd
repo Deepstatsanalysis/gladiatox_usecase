@@ -1,0 +1,342 @@
+---
+title: "GladiaTOX: R Package for Processing High Content Screening data"
+author:
+- name: Vincenzo Belcastro
+- name: Stephane Cano
+- name: Florian Martin
+
+package: GladiaTOX
+output:
+    BiocStyle::html_document
+vignette: >
+    %\VignetteIndexEntry{GladiaTOX}
+    %\VignetteEngine{knitr::rmarkdown}
+    %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+    collapse = TRUE,
+    comment = "#>",
+    root.dir = "/gpfshpc/data/pmrdcdb/WORKSPACE_VBELCASTRO/gtox_usecase"
+)
+```
+
+# Introduction
+
+`GladiaTOX` (*Belcastro et al., 2019*) is an open-source solution for HCS data processing and reporting 
+that expands the `tcpl` package (toxcast pipeline, *Filer et al., 2016*). In
+addition to `tcpl`'s functionalities (multiple dose-response fitting and best 
+fit selection), `GladiaTOX`
+
+- Fetches raw image quantifications via a webservice layer, also allowing 
+multiple (proprietary) systems to be integrated easily
+- Computes minimal effective concentrations based also on historical data
+- Exports results formatted for ToxPI GUI
+- Compute exposure severity scores
+- Implements a suite of functionalities for quality control and processing 
+reporting
+
+## Installation and package load
+```{r, eval=FALSE, include=TRUE}
+if(!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("GladiaTOX")
+BiocManager::install("stringr")
+```
+
+```{r, eval=TRUE, echo=TRUE, include=FALSE}
+# Load GladiaTOX package
+library(GladiaTOX)
+library(stringr)
+```
+
+```{r, eval=FALSE, include=TRUE}
+# Set working directory
+# Here is where you need to save the raw data (see below)
+working_directory = "myworkingdirectory"
+setwd(working_directory)
+```
+
+<div style="position:relative; top:0px; right:0px">
+```{r logo, echo=FALSE, out.width='60%'}
+glPlotPieLogo()
+```
+</div>
+
+## Database configuration
+The `GladiaTOX` installation includes the deployment of a sqlite database 
+(`sql/gladiatoxdb.sqlite` folder). This file contains the database structure 
+already initialized with the necessary content needed for data processing (e.g.
+processing methods entries).
+
+The first step after database deployment is to configure access parameters. 
+Let's create a copy of the database in the working directory
+```{r, eval=TRUE, echo=TRUE, include=TRUE}
+# Create a copy of the DB in the working directory
+file.copy(file.path(system.file(package="GladiaTOX"), "sql", "gladiatoxdb.sqlite"), "./", overwrite=TRUE)
+sqlite_src = "./gladiatoxdb.sqlite"
+```
+
+The `gtoxConf` configuration command below initializes all necessary variables.
+```{r, eval=TRUE, echo=TRUE, include=TRUE}
+# sqlite database location
+gtoxConf(   drvr = "SQLite",
+            host = NA,
+            user = NA,
+            pass = NULL,
+            db = sqlite_src)
+```
+This database will be used in next sections to load and process a second study 
+phase. The sqlite database can be seen as a sample database used for the 
+following example.
+
+## Deployed database
+The deployed database already contains fully processed study, with
+
+- `asid`: 1 (assay source id), the unique study identifier
+- `asnm`: SampleStudy (assay source name), the names of the study
+- `asph`: PhaseI (assay source phase), the study phase
+
+The purpose of the call `gtoxLoadAsid()` is to list all studies available in the
+database.
+```{r, eval=TRUE, echo=TRUE, include=TRUE}
+# List available studies
+gtoxLoadAsid()
+```
+
+# Data and metadata
+In this section we will explore one simple way for loading and processing HCS 
+data stored in INTERVALS:
+
+1. Access https://www.intervals.science/
+2. Locate the "flavor toolbox" study
+    + https://doi.org/10.26126/intervals.lwo6mb.1
+3. Download the HCS dataset in your working directory
+
+```{r, eval=TRUE, include=TRUE, echo=TRUE}
+# Load data
+mdat = read.csv("S167360_Lung_HCS_raw_metadata.csv")
+mydat = read.csv("S167360_Lung_HCS_raw_data.csv")
+
+# Setup study information
+studyname = "FlavorToolbox"
+phasename = "All"
+```
+
+## `plate`: plate metadata
+The `plate` object stores metadata with plate information. 
+
+Most of the columns have self-contained names and content; `plate` is the plate 
+number (usually an integer); `tube` is the well location (H1 is row 8 column 1);
+`well_type` is the content type of the well (`c` positive control, `t` 
+treatment, `n` is the negative control); `endpoint` contains assay names with no
+exposure duration info appended; `u_boxtrack` is a plate identifier used to join
+the `plate` metadata table with the raw data table prior data is loaded in the 
+GladiaTOX database.
+
+```{r, eval=TRUE, echo=TRUE, include=TRUE}
+# Build plate table
+myplate = data.frame(
+    "stimulus" = as.character(mdat$TestItem),
+    "stimulus concentration" = paste(mdat$TestItemConcentration, "uM"),
+    "exposure duration" = paste0(mdat$ExposureDuration, "h"),
+    "plate" = as.numeric(as.factor(mdat$PlateID)),
+    "tube" = mdat$Tube,
+    "well_type" = mdat$WellType,
+    "vehicle_name" = paste0("veh", mdat$VehicleID),
+    "study" = studyname,
+    "study.phase" = phasename,
+    "cell type" = "NHBE",
+    "endpoint" = mdat$EndpointCategory,
+    "exposure date" = "2019-11-01",
+    "plate_set" = 0,
+    "Biological Replicate" = 1,
+    "smkid" = "",
+    "well format" = "96-well",
+    "assay" = paste(mdat$EndpointCategory, paste0(mdat$ExposureDuration, "h"), sep="_"),
+    "Date" = "2019-11-01",
+    "u_boxtrack" = mdat$PlateID,
+    check.names=FALSE, stringsAsFactors=FALSE)
+myplate$stimulus[myplate$well_type=="n"] = myplate$vehicle_name[myplate$well_type=="n"]
+myplate$stimulus[myplate$well_type=="c"] = "PosCTRL"
+myplate["stimulus concentration"][myplate["well_type"]=="n"] = ""
+```
+
+## `chnmap`: assay metadata and channel mapping
+The second metadata table contains assay mapping information.
+
+Five endpoints are part of the cytotoxicity assay (e.g., *Cell count*, 
+*membranepermeability*). Two endpoints are shown to be part of the DNA damage 
+assay. Since multiple endpoints can be read from the same plate, each of them is
+read on a separate channel. This column will also be used later on to join 
+meatadata and data tables.
+
+```{r, eval=TRUE, echo=TRUE, include=TRUE}
+# Build channel mapping
+mydat$channel = mdat$Channel[match(mydat$SampleID, mdat$SampleID)]
+mychnmap = data.frame(Assay = unique(mydat[, c("EndpointCategory", "EndpointName", "channel")])$EndpointCategory,
+                      Endpoint = unique(mydat[, c("EndpointCategory", "EndpointName", "channel")])$EndpointName,
+                      Channel = unique(mydat[, c("EndpointCategory", "EndpointName", "channel")])$channel)
+```
+
+The content of `plate` and `chnmap` are then combined to generate the assay 
+table. In the assay table, assay and endpoint are concatenated to timepoints 
+to generate assays entries for the database.
+```{r, echo=TRUE, eval=TRUE}
+# Build assay table from plate and channel mapping file
+myassay <- buildAssayTab(myplate, mychnmap)
+print(head(myassay, 4), row.names = FALSE)
+```
+## `mydat`: image quantification raw data
+The data table is an export from the image quantification instrument.
+
+This table contains the raw fluorescence quantification values: `measure_val`; 
+`rowi` and `coli` are the row and column indexes; `machine_name` is the channel 
+name and is used to join this table with the assay table above; `u_boxtrack` 
+is the plate identified and is used to join the table with the plate table.
+```{r, eval=TRUE, echo=TRUE, include=TRUE}
+print(head(mydat), row.names = FALSE)
+```
+
+# Database loading
+In this sections data and metadata will be loaded in the GladiaTOX database. 
+
+## Register study info in database
+The following code will register metadata file content in the database, 
+including: assays, endpoints, treatments and controls. The status of the assay 
+source table (study table) before and after new study creation is displayed 
+below calling `gtoxLoadAsid()`. The purpose of the call is to list all studies 
+available in the database before and after the new study is added with the 
+function `loadAnnot()`.
+```{r, echo=TRUE, eval=TRUE, message=FALSE, warning=TRUE}
+## List of studies before loading
+gtoxLoadAsid()
+## Load annotation in gtoxDB
+loadAnnot(myplate, myassay, NULL)
+## List of studies after loading
+gtoxLoadAsid()
+```
+The `loadAnnot` function call registers multiple study parameters in the 
+database, including the creation of the new assay source id (asid). The asid 
+identifies the pair study name, study phase. The asid is what will be used to 
+load raw data of the study, process the study and generate reports.
+
+## Load raw data in database
+The `asid` just created can be retrieved by querying the database and specify 
+the study name and phase.
+```{r, echo=TRUE, eval=TRUE}
+# Get assay source ID
+asid = gtoxLoadAsid(fld = c("asnm", "asph"), val = list(studyname, phasename))$asid
+asid
+```
+The `asid` and the `mydat` objects are the inputs to the `prepareDatForDB` 
+function used to join metadata stored in database to the raw data stored in 
+the `mydat` object.
+
+Raw data is then loaded in the database with the `gtoxWriteData` function. 
+```{r, echo=TRUE, eval=TRUE}
+# Prepare and load data
+# Format raw data from file and load in DB
+tt = merge(mydat, mdat, by="SampleID")
+mydat = data.table(
+    measure_val = tt$EndpointValue,
+    rowi = match(toupper(str_extract(tt$Tube, '[A-Z]+')), LETTERS),
+    coli = as.numeric(str_extract(tt$Tube, '[0-9]+')),
+    machine_name = tt$channel,
+    u_boxtrack = tt$PlateID)
+mydat <- prepareDatForDB(asid=asid, mydat)
+gtoxWriteData(mydat[ , list(acid, waid, wllq, rval)], lvl = 0, type = "mc")
+```
+Study whose `asid` is `2` is now ready to be processed.
+
+# Data processing and reporting
+Metadata and data are now registered in the database. Next step is to select 
+the processing methods we want to apply on the data. There are multiple levels 
+of processing (see `gtoxLoadMthd(lvl=3)` for details). The function 
+`assignDefaultMthds` is a shortcut to assign all levels methods at once. The 
+methods selected would probably fit well to most users.
+```{r, echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+assignDefaultMthds(asid = asid)
+```
+With the default selection, raw data is normalized by computing the log2 fold 
+change of values in each well against the median of the corresponding controls.
+
+## Compute the noise band
+The package computes a noise band to discriminate concentration series that are 
+active versus those that are not. To compute the noise band we need to process 
+and normalize vehicle's data running the following code:
+```{r, include=TRUE, results='hide', message=FALSE, warning=FALSE}
+# Run level 1 to level 3 functions
+res <- gtoxRun(asid = asid, slvl = 1, elvl = 3)
+```
+
+The default behaviour is to compute noise band margins separately for each 
+endpoint. Margins correspond to 3 times the baseline median absolute deviation 
+of vehicle responses. The following code computes the cutoffs and store them in 
+the database.
+```{r, include=TRUE, results='hide', message=FALSE, warning=FALSE}
+# Extract assay endpoints ids of the study
+aeidtab = gtoxLoadAeid(fld="asid", val=asid)
+
+# Compute Vehicle Median Absolute deviation
+tmp <- mapply(function(xx){
+    tryCatch(gtoxCalcVmad(inputs = xx, aeid = xx, 
+                          notes = "computed within study"), 
+             error = function(e) NULL)},
+    as.integer(aeidtab$aeid))
+```
+
+# Data processing and reporting
+## Process data
+Now that the user has selected the processing methods, cutoffs computed, and bad
+quality plates masked, all information is in place to start processing the data
+with the following command.
+
+Once the database is populated with noise band margins, then all chemical's data
+can be processed.
+```{r, include=TRUE, results='hide', message=FALSE, warning=FALSE}
+# Apply all functions from level 1 to level 6
+res <- gtoxRun(asid = asid, slvl = 1, elvl = 6)
+```
+
+The `gtoxRun` returns a list of vectors of logical values used to check 
+processing status. The resulting processed data is automatically stored in the
+database along with the statistics computed. Statistics include activity
+concentrations (AC10 and AC50) and minimal effective concentrations (MECs).
+
+## Data reporting
+
+The `gtoxReport` function, with option `type = "all"`, triggers the generation
+of the full processing report. The pdf file created includes summary tables, 
+dose-response curves (as seen later), and other plots for all chemicals tested
+in the study (see package vignettes for details).
+
+## Additional reporting plots
+Additional reporting plots, not included in the full report, can be obtained as
+described below.
+
+MEC values can be reported in a piechart. Below an example.
+```{r, echo=TRUE, include=TRUE, message=FALSE, warning=FALSE, results='hide'}
+#select endpoint and chemicals for pie chart
+tf = !(grepl("NF-kB", aeidtab$aenm) |
+           grepl("count", aeidtab$aenm, fixed=TRUE))
+chnms = c("28-flavor mixture", "Alpha pinene", "Eucalyptol", "Matrix")
+glPlotPie(asid, aeids=aeidtab$aeid[tf], chnms=chnms, 
+          expos.time.ordr=c("4h", "24h"))
+```
+
+The pie plot reports the mean MECs for all endpoints measured in the study. Time
+points are reported to the right (4h, 24h). Each slice is associated to an 
+endpoint. Numbers on the slides indicate the corresponding MEC means.
+
+Severity scores can also be computed and displayed. This score indicate the 
+average impact of chemicals across multiple endpoints.
+```{r, eval=TRUE, echo=TRUE, include=TRUE, warning=FALSE, fig.width=10, fig.height=6, fig.cap='Example of severity score plot.'}
+glPlotToxInd(asid)
+```
+Example of severity score plot reporting the full list of chemicals used in the
+study; y-axis reports the severity score value (normalized between 0 and 1); 
+x-axis in just the index of the chemical.
+
+
