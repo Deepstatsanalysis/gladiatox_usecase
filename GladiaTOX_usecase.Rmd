@@ -17,9 +17,8 @@ vignette: >
 ```{r setup, include = FALSE}
 knitr::opts_chunk$set(
     collapse = TRUE,
-    comment = "#>",
-    root.dir = "/gpfshpc/data/pmrdcdb/WORKSPACE_VBELCASTRO/gtox_usecase"
-)
+    comment = "#>"
+    )
 ```
 
 # Introduction
@@ -113,11 +112,13 @@ data stored in INTERVALS:
 2. Locate the "flavor toolbox" study
     + https://doi.org/10.26126/intervals.lwo6mb.1
 3. Download the HCS dataset in your working directory
+    + Datasets -> "S167360 - HCS - NHBE - RAW"
+4. Unzip the content in your working directory
 
 ```{r, eval=TRUE, include=TRUE, echo=TRUE}
 # Load data
-mdat = read.csv("S167360_Lung_HCS_raw_metadata.csv")
-mydat = read.csv("S167360_Lung_HCS_raw_data.csv")
+mdat = read.csv(file.path("metadata", "S167360_Lung_HCS_raw_metadata.csv"))
+mydat = read.csv(file.path("data", "S167360_Lung_HCS_raw_data.csv"))
 
 # Setup study information
 studyname = "FlavorToolbox"

@@ -1,0 +1,5 @@
+In case you knit the Rmd file don't forget to setup the root dir:
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+    root.dir = "yourworkingdirectotypath"
+)
